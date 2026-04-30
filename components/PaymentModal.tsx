@@ -277,9 +277,12 @@ export default function PaymentModal({
   };
 
   const handleRetry = () => {
+    clearPaymentTimeout();
     setStatus('summary');
     setErrorTitle('');
     setErrorMessage('');
+    setTimeRemaining(PAYMENT_TIMEOUT_MS / 1000);
+    isPaymentActiveRef.current = false;
     
     toast({
       title: 'Ready to Retry',
