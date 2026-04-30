@@ -48,12 +48,12 @@ export default function LoanApplicationForm() {
 
         if (typesRes.ok) {
           const types = await typesRes.json();
-          setLoanTypes(types);
+          setLoanTypes(Array.isArray(types) ? types : []);
         }
 
         if (employmentRes.ok) {
           const employment = await employmentRes.json();
-          setEmploymentTypes(employment);
+          setEmploymentTypes(Array.isArray(employment) ? employment : []);
         }
       } catch (error) {
         console.error('Failed to fetch data:', error);

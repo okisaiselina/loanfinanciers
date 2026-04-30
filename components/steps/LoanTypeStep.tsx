@@ -30,7 +30,7 @@ export default function LoanTypeStep({
     onUpdate({ loanTypeId });
   };
 
-  const selectedLoan = loanTypes.find((lt) => lt.id === formData.loanTypeId);
+  const selectedLoan = loanTypes?.find((lt) => lt.id === formData.loanTypeId);
 
   return (
     <div className="space-y-4 sm:space-y-6 animate-slideUp">
@@ -46,7 +46,7 @@ export default function LoanTypeStep({
           className="w-full px-3 sm:px-4 py-3 sm:py-4 bg-gray-900 border border-gold-500/30 rounded-lg text-sm sm:text-base text-white cursor-pointer appearance-none transition-all duration-300 hover:border-gold-500 focus:outline-none focus:ring-2 focus:ring-gold-500/50"
         >
           <option value="">-- Select a loan type --</option>
-          {loanTypes.map((loan) => (
+          {loanTypes?.map((loan) => (
             <option key={loan.id} value={loan.id}>
               {loan.name} (KES {loan.min_amount.toLocaleString()} – {loan.max_amount.toLocaleString()})
             </option>
