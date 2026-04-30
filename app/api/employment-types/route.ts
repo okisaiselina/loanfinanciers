@@ -8,7 +8,7 @@ export async function GET() {
       return Response.json({ error: error.message }, { status: 500 });
     }
 
-    return Response.json(data);
+    return Response.json(data || []);
   } catch (error) {
     return Response.json(
       { error: 'Failed to fetch employment types' },
