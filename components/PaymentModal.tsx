@@ -1,14 +1,31 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { X, Loader2, Check, AlertCircle } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { X, Loader2, Check, AlertCircle, Clock } from 'lucide-react';
 import type { LoanFormData } from '@/hooks/use-loan-form';
 import { useToast } from '@/hooks/use-toast';
 
 declare global {
   interface Window {
-    PaystackPop: any;
+    PaystackPop: {
+      setup: (config: PaystackConfig) => { openIframe: () => void };
+    };
   }
+}
+
+interface PaystackConfig {
+  key: string;
+  email: string;
+  amount: number;
+  currency: string;
+  ref: string;
+  metadata: {
+    loan_application_id: string;
+    customer_name: string;
+    phone_number: string;
+  };
+  onClose: () => void;
+  callback: (response: { reference: string; status: string }) => void;
 }
 
 interface LoanType {
@@ -25,7 +42,9 @@ interface PaymentModalProps {
   onSuccess: () => void;
 }
 
-type PaymentStatus = 'summary' | 'processing' | 'success' | 'failed';
+type PaymentStatus = 'summary' | 'processing' | 'success' | 'failed' | 'timeout' | 'cancelled';
+
+const PAYMENT_TIMEOUT_MS = 45000; // 45 seconds timeout
 
 export default function PaymentModal({
   formData,
@@ -38,10 +57,23 @@ export default function PaymentModal({
   const [requestId, setRequestId] = useState('');
   const [errorTitle, setErrorTitle] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
+  const [timeRemaining, setTimeRemaining] = useState(PAYMENT_TIMEOUT_MS / 1000);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const countdownRef = useRef<NodeJS.Timeout | null>(null);
+  const paystackHandlerRef = useRef<{ openIframe: () => void } | null>(null);
+  const isPaymentActiveRef = useRef(false);
 
   const selectedLoan = loanTypes.find((lt) => lt.id === formData.loanTypeId);
   // IMPORTANT: Only access fee is charged via Paystack - not interest amount
   const totalPaymentAmount = formData.accessFee;
+
+  // Cleanup timeouts on unmount
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      if (countdownRef.current) clearInterval(countdownRef.current);
+    };
+  }, []);
 
   // Load Paystack script
   useEffect(() => {
@@ -50,22 +82,106 @@ export default function PaymentModal({
     script.async = true;
     document.body.appendChild(script);
     return () => {
-      document.body.removeChild(script);
+      if (document.body.contains(script)) {
+        document.body.removeChild(script);
+      }
     };
   }, []);
 
-  const handleConfirmPayment = async () => {
+  const startPaymentTimeout = () => {
+    setTimeRemaining(PAYMENT_TIMEOUT_MS / 1000);
+    
+    // Start countdown timer
+    countdownRef.current = setInterval(() => {
+      setTimeRemaining((prev) => {
+        if (prev <= 1) {
+          if (countdownRef.current) clearInterval(countdownRef.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    // Set main timeout
+    timeoutRef.current = setTimeout(() => {
+      if (isPaymentActiveRef.current) {
+        isPaymentActiveRef.current = false;
+        setStatus('timeout');
+        setErrorTitle('Payment Timeout');
+        setErrorMessage('The payment session has expired after 45 seconds. Please try again.');
+        toast({
+          title: 'Payment Timeout',
+          description: 'The payment window was open for too long. Please try again.',
+          variant: 'destructive',
+        });
+      }
+    }, PAYMENT_TIMEOUT_MS);
+  };
+
+  const clearPaymentTimeout = () => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    if (countdownRef.current) {
+      clearInterval(countdownRef.current);
+      countdownRef.current = null;
+    }
+  };
+
+  const handlePaymentClose = () => {
+    clearPaymentTimeout();
+    if (isPaymentActiveRef.current) {
+      isPaymentActiveRef.current = false;
+      setStatus('cancelled');
+      setErrorTitle('Payment Cancelled');
+      setErrorMessage('You closed the payment window. Your loan application was not completed.');
+      toast({
+        title: 'Payment Cancelled',
+        description: 'You closed the payment window before completing the transaction.',
+        variant: 'destructive',
+      });
+    }
+  };
+
+  const handlePaymentSuccess = async (reference: string) => {
+    clearPaymentTimeout();
+    isPaymentActiveRef.current = false;
+    
     try {
-      console.log('%c[PAYSTACK] ===== PAYMENT FLOW STARTED =====', 'color: #00ff00; font-weight: bold; font-size: 14px');
-      console.log('%c[PAYSTACK] Form Data:', 'color: #00ffff', {
-        loanTypeId: formData.loanTypeId,
-        phoneNumber: formData.phoneNumber,
-        requestedAmount: formData.requestedAmount,
-        accessFee: formData.accessFee,
-        interestAmount: formData.interestAmount,
-        totalPaymentAmount,
+      // Confirm payment on backend
+      const confirmResponse = await fetch(`/api/loan-applications/${reference}/confirm-payment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reference }),
       });
 
+      if (confirmResponse.ok) {
+        setStatus('success');
+        toast({
+          title: 'Payment Successful!',
+          description: 'Your loan application has been submitted successfully. You will receive a response within 12-72 hours.',
+        });
+      } else {
+        // Payment was made but confirmation failed - still show success
+        setStatus('success');
+        toast({
+          title: 'Payment Received',
+          description: 'Your payment was received. Your application is being processed.',
+        });
+      }
+    } catch {
+      // Even if confirmation API fails, payment was successful on Paystack
+      setStatus('success');
+      toast({
+        title: 'Payment Successful!',
+        description: 'Your loan application has been submitted successfully.',
+      });
+    }
+  };
+
+  const handleConfirmPayment = async () => {
+    try {
       setStatus('processing');
       setErrorTitle('');
       setErrorMessage('');
@@ -73,12 +189,10 @@ export default function PaymentModal({
       // Show initial toast
       toast({
         title: 'Payment Initiated',
-        description: 'Opening Paystack payment gateway. You will be redirected to complete your payment.',
+        description: 'Opening Paystack payment gateway. Complete payment within 45 seconds.',
       });
 
       // Step 1: Create loan application
-      console.log('%c[PAYSTACK] Step 1: Creating Loan Application', 'color: #ffaa00; font-weight: bold');
-      
       const applicationResponse = await fetch('/api/loan-applications', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -96,79 +210,63 @@ export default function PaymentModal({
       });
 
       const applicationDataJson = await applicationResponse.json();
-      console.log('%c[PAYSTACK] Application Response:', 'color: #00ffff', {
-        status: applicationResponse.status,
-        ok: applicationResponse.ok,
-        data: applicationDataJson,
-      });
 
       if (!applicationResponse.ok) {
         const errorMsg = applicationDataJson.error || 'Failed to create loan application';
-        console.error('%c[PAYSTACK] ERROR - Application creation failed:', 'color: #ff0000; font-weight: bold', errorMsg);
         throw new Error(errorMsg);
       }
 
       const applicationData = applicationDataJson;
       
       if (!applicationData.id) {
-        console.error('%c[PAYSTACK] ERROR - No application ID returned', 'color: #ff0000; font-weight: bold');
         throw new Error('Invalid application response - no ID returned');
       }
 
-      console.log('%c[PAYSTACK] Application Created Successfully:', 'color: #00ff00', { id: applicationData.id });
       setRequestId(applicationData.id);
 
-      // Step 2: Initialize Paystack payment
-      console.log('%c[PAYSTACK] Step 2: Initializing Paystack Payment', 'color: #ffaa00; font-weight: bold');
-      console.log('%c[PAYSTACK] ⚠ IMPORTANT: ONLY ACCESS FEE IS CHARGED', 'color: #ff6600; font-weight: bold; font-size: 12px');
-      console.log('%c[PAYSTACK] Payment Breakdown:', 'color: #00ffff', {
-        accessFeeOnly: formData.accessFee,
-        interestNotChargedNow: formData.interestAmount,
-        paystackAmount: totalPaymentAmount * 100, // Paystack uses kobo
-        note: 'Interest will be deducted from loan disbursement, NOT from payment',
-      });
-
-      // Initialize Paystack payment
-      const response = await fetch('/api/paystack/initialize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          amount: totalPaymentAmount,
-          email: `user-${applicationData.id}@loans.app`,
-          reference: applicationData.id,
-          fullName: formData.fullName,
-          phoneNumber: formData.phoneNumber,
-        }),
-      });
-
-      const paymentDataJson = await response.json();
-      console.log('%c[PAYSTACK] Initialize Response:', 'color: #00ffff', paymentDataJson);
-
-      if (!response.ok) {
-        const errorMsg = paymentDataJson.error || 'Failed to initialize payment';
-        console.error('%c[PAYSTACK] ERROR - Initialization Failed:', 'color: #ff0000; font-weight: bold', errorMsg);
-        throw new Error(errorMsg);
+      // Check if Paystack is loaded
+      if (!window.PaystackPop) {
+        throw new Error('Payment service not loaded. Please refresh the page and try again.');
       }
 
-      const { authorization_url } = paymentDataJson;
-      if (!authorization_url) {
-        throw new Error('Failed to get payment authorization URL');
+      // Get Paystack public key
+      const publicKey = process.env.NEXT_PUBLIC_PAYSTACK_PUBLIC_KEY;
+      if (!publicKey) {
+        throw new Error('Payment configuration error. Please contact support.');
       }
 
-      console.log('%c[PAYSTACK] ===== PAYSTACK INITIALIZED SUCCESSFULLY =====', 'color: #00ff00; font-weight: bold; font-size: 14px');
-      console.log('%c[PAYSTACK] Reference:', 'color: #00ff00', applicationData.id);
+      // Start the payment timeout
+      isPaymentActiveRef.current = true;
+      startPaymentTimeout();
 
-      // Redirect to Paystack payment page
-      window.location.href = authorization_url;
+      // Step 2: Initialize Paystack inline popup
+      const handler = window.PaystackPop.setup({
+        key: publicKey,
+        email: `user-${applicationData.id}@loans.app`,
+        amount: totalPaymentAmount * 100, // Convert to kobo
+        currency: 'KES',
+        ref: applicationData.id,
+        metadata: {
+          loan_application_id: applicationData.id,
+          customer_name: formData.fullName,
+          phone_number: formData.phoneNumber,
+        },
+        onClose: handlePaymentClose,
+        callback: (response: { reference: string; status: string }) => {
+          handlePaymentSuccess(response.reference);
+        },
+      });
+
+      paystackHandlerRef.current = handler;
+      handler.openIframe();
 
     } catch (err) {
-      console.error('%c[PAYSTACK] ===== PAYMENT INITIATION FAILED =====', 'color: #ff0000; font-weight: bold; font-size: 14px');
-      console.error('%c[PAYSTACK] Error Details:', 'color: #ff0000', err);
-      
+      clearPaymentTimeout();
+      isPaymentActiveRef.current = false;
       setStatus('failed');
       const errMsg = err instanceof Error ? err.message : 'Network error occurred';
       setErrorTitle('Payment failed');
-      setErrorMessage('');
+      setErrorMessage(errMsg);
       
       toast({
         title: 'Payment Initiation Failed',
@@ -179,9 +277,12 @@ export default function PaymentModal({
   };
 
   const handleRetry = () => {
+    clearPaymentTimeout();
     setStatus('summary');
     setErrorTitle('');
     setErrorMessage('');
+    setTimeRemaining(PAYMENT_TIMEOUT_MS / 1000);
+    isPaymentActiveRef.current = false;
     
     toast({
       title: 'Ready to Retry',
@@ -199,6 +300,8 @@ export default function PaymentModal({
             {status === 'processing' && 'Processing Payment'}
             {status === 'success' && 'Payment Successful'}
             {status === 'failed' && 'Payment Failed'}
+            {status === 'timeout' && 'Payment Timeout'}
+            {status === 'cancelled' && 'Payment Cancelled'}
           </h2>
           {status === 'summary' && (
             <button
@@ -255,10 +358,17 @@ export default function PaymentModal({
                 <Loader2 className="w-10 h-10 sm:w-12 sm:h-12 text-gold-500 animate-spin" />
               </div>
               <div className="space-y-3 sm:space-y-4">
-                <p className="font-semibold text-base sm:text-lg text-white">Opening Paystack</p>
+                <p className="font-semibold text-base sm:text-lg text-white">Complete Payment</p>
                 <div className="bg-gold-500/10 border border-gold-500/30 rounded-lg p-3 sm:p-4">
-                  <p className="text-xs sm:text-sm text-gold-100 leading-relaxed">You will be redirected to Paystack to complete your payment securely.</p>
+                  <p className="text-xs sm:text-sm text-gold-100 leading-relaxed">Complete your payment in the Paystack popup window.</p>
                 </div>
+                <div className="flex items-center justify-center gap-2 text-sm">
+                  <Clock className="w-4 h-4 text-gold-500" />
+                  <span className={`font-mono font-semibold ${timeRemaining <= 10 ? 'text-red-400' : 'text-gold-500'}`}>
+                    {timeRemaining}s remaining
+                  </span>
+                </div>
+                <p className="text-xs text-gray-500">Payment will timeout after 45 seconds</p>
               </div>
             </div>
           )}
@@ -286,7 +396,35 @@ export default function PaymentModal({
               <div className="space-y-3 sm:space-y-4">
                 <p className="font-bold text-base sm:text-xl text-white">Payment Failed</p>
                 <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4 sm:p-5">
-                  <p className="text-xs sm:text-sm text-red-100 leading-relaxed">{errorTitle || 'Your payment could not be processed. Please try again.'}</p>
+                  <p className="text-xs sm:text-sm text-red-100 leading-relaxed">{errorMessage || errorTitle || 'Your payment could not be processed. Please try again.'}</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {status === 'timeout' && (
+            <div className="space-y-4 sm:space-y-5 text-center py-4 sm:py-8">
+              <div className="flex justify-center">
+                <Clock className="w-12 h-12 sm:w-16 sm:h-16 text-orange-500" />
+              </div>
+              <div className="space-y-3 sm:space-y-4">
+                <p className="font-bold text-base sm:text-xl text-white">Payment Timeout</p>
+                <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-4 sm:p-5">
+                  <p className="text-xs sm:text-sm text-orange-100 leading-relaxed">The payment session has expired after 45 seconds. Please try again to complete your loan application.</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {status === 'cancelled' && (
+            <div className="space-y-4 sm:space-y-5 text-center py-4 sm:py-8">
+              <div className="flex justify-center">
+                <X className="w-12 h-12 sm:w-16 sm:h-16 text-gray-500" />
+              </div>
+              <div className="space-y-3 sm:space-y-4">
+                <p className="font-bold text-base sm:text-xl text-white">Payment Cancelled</p>
+                <div className="bg-gray-500/10 border border-gray-500/30 rounded-lg p-4 sm:p-5">
+                  <p className="text-xs sm:text-sm text-gray-300 leading-relaxed">You closed the payment window before completing the transaction. Your loan application was not submitted.</p>
                 </div>
               </div>
             </div>
@@ -312,7 +450,7 @@ export default function PaymentModal({
             </>
           )}
 
-          {status === 'failed' && (
+          {(status === 'failed' || status === 'timeout' || status === 'cancelled') && (
             <>
               <button
                 onClick={onClose}
@@ -324,7 +462,7 @@ export default function PaymentModal({
                 onClick={handleRetry}
                 className="flex-1 py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-gold-500 text-black font-semibold rounded-lg hover:bg-gold-600 transition-all duration-300"
               >
-                Retry
+                Try Again
               </button>
             </>
           )}
