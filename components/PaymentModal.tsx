@@ -7,25 +7,24 @@ import { useToast } from '@/hooks/use-toast';
 
 declare global {
   interface Window {
-    PaystackPop: {
-      setup: (config: PaystackConfig) => { openIframe: () => void };
-    };
+    IntaSend: new (config: IntaSendConfig) => IntaSendInstance;
   }
 }
 
-interface PaystackConfig {
-  key: string;
-  email: string;
-  amount: number;
-  currency: string;
-  ref: string;
-  metadata: {
-    loan_application_id: string;
-    customer_name: string;
-    phone_number: string;
-  };
-  onClose: () => void;
-  callback: (response: { reference: string; status: string }) => void;
+interface IntaSendConfig {
+  publicAPIKey: string;
+  live: boolean;
+}
+
+interface IntaSendInstance {
+  on: (event: 'COMPLETE' | 'FAILED' | 'IN-PROGRESS', callback: (response?: IntaSendResponse) => void) => IntaSendInstance;
+}
+
+interface IntaSendResponse {
+  status?: string;
+  tracking_id?: string;
+  signature?: string;
+  checkout_id?: string;
 }
 
 interface LoanType {
@@ -58,13 +57,14 @@ export default function PaymentModal({
   const [errorTitle, setErrorTitle] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [timeRemaining, setTimeRemaining] = useState(PAYMENT_TIMEOUT_MS / 1000);
+  const [intaSendReady, setIntaSendReady] = useState(false);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const countdownRef = useRef<NodeJS.Timeout | null>(null);
-  const paystackHandlerRef = useRef<{ openIframe: () => void } | null>(null);
   const isPaymentActiveRef = useRef(false);
+  const intaSendInstanceRef = useRef<IntaSendInstance | null>(null);
 
   const selectedLoan = loanTypes.find((lt) => lt.id === formData.loanTypeId);
-  // IMPORTANT: Only access fee is charged via Paystack - not interest amount
+  // IMPORTANT: Only access fee is charged via IntaSend - not interest amount
   const totalPaymentAmount = formData.accessFee;
 
   // Cleanup timeouts on unmount
@@ -75,18 +75,43 @@ export default function PaymentModal({
     };
   }, []);
 
-  // Load Paystack script
+  // Load IntaSend script and initialize
   useEffect(() => {
     const script = document.createElement('script');
-    script.src = 'https://js.paystack.co/v1/inline.js';
+    script.src = 'https://unpkg.com/intasend-inlinejs-sdk@4.0.7/build/intasend-inline.js';
     script.async = true;
+    script.onload = () => {
+      // Initialize IntaSend after script loads
+      const publicKey = process.env.NEXT_PUBLIC_INTASEND_PUBLIC_KEY;
+      if (publicKey && window.IntaSend) {
+        const instance = new window.IntaSend({
+          publicAPIKey: publicKey,
+          live: true, // Set to true for live environment
+        });
+        
+        instance
+          .on('COMPLETE', (response) => {
+            handlePaymentSuccess(response?.tracking_id || requestId);
+          })
+          .on('FAILED', (response) => {
+            handlePaymentFailed(response);
+          })
+          .on('IN-PROGRESS', () => {
+            // Payment is in progress, keep the processing state
+          });
+        
+        intaSendInstanceRef.current = instance;
+        setIntaSendReady(true);
+      }
+    };
     document.body.appendChild(script);
+    
     return () => {
       if (document.body.contains(script)) {
         document.body.removeChild(script);
       }
     };
-  }, []);
+  }, [requestId]);
 
   const startPaymentTimeout = () => {
     setTimeRemaining(PAYMENT_TIMEOUT_MS / 1000);
@@ -129,16 +154,16 @@ export default function PaymentModal({
     }
   };
 
-  const handlePaymentClose = () => {
+  const handlePaymentFailed = (response?: IntaSendResponse) => {
     clearPaymentTimeout();
     if (isPaymentActiveRef.current) {
       isPaymentActiveRef.current = false;
-      setStatus('cancelled');
-      setErrorTitle('Payment Cancelled');
-      setErrorMessage('You closed the payment window. Your loan application was not completed.');
+      setStatus('failed');
+      setErrorTitle('Payment Failed');
+      setErrorMessage(response?.status || 'Your payment could not be processed. Please try again.');
       toast({
-        title: 'Payment Cancelled',
-        description: 'You closed the payment window before completing the transaction.',
+        title: 'Payment Failed',
+        description: 'Your payment could not be completed. Please try again.',
         variant: 'destructive',
       });
     }
@@ -171,7 +196,7 @@ export default function PaymentModal({
         });
       }
     } catch {
-      // Even if confirmation API fails, payment was successful on Paystack
+      // Even if confirmation API fails, payment was successful on IntaSend
       setStatus('success');
       toast({
         title: 'Payment Successful!',
@@ -189,7 +214,7 @@ export default function PaymentModal({
       // Show initial toast
       toast({
         title: 'Payment Initiated',
-        description: 'Opening Paystack payment gateway. Complete payment within 45 seconds.',
+        description: 'Opening IntaSend payment gateway. Complete payment within 45 seconds.',
       });
 
       // Step 1: Create loan application
@@ -224,13 +249,13 @@ export default function PaymentModal({
 
       setRequestId(applicationData.id);
 
-      // Check if Paystack is loaded
-      if (!window.PaystackPop) {
+      // Check if IntaSend is ready
+      if (!intaSendReady || !window.IntaSend) {
         throw new Error('Payment service not loaded. Please refresh the page and try again.');
       }
 
-      // Get Paystack public key
-      const publicKey = process.env.NEXT_PUBLIC_PAYSTACK_PUBLIC_KEY;
+      // Get IntaSend public key
+      const publicKey = process.env.NEXT_PUBLIC_INTASEND_PUBLIC_KEY;
       if (!publicKey) {
         throw new Error('Payment configuration error. Please contact support.');
       }
@@ -239,26 +264,21 @@ export default function PaymentModal({
       isPaymentActiveRef.current = true;
       startPaymentTimeout();
 
-      // Step 2: Initialize Paystack inline popup
-      const handler = window.PaystackPop.setup({
-        key: publicKey,
-        email: `user-${applicationData.id}@loans.app`,
-        amount: totalPaymentAmount * 100, // Convert to kobo
-        currency: 'KES',
-        ref: applicationData.id,
-        metadata: {
-          loan_application_id: applicationData.id,
-          customer_name: formData.fullName,
-          phone_number: formData.phoneNumber,
-        },
-        onClose: handlePaymentClose,
-        callback: (response: { reference: string; status: string }) => {
-          handlePaymentSuccess(response.reference);
-        },
-      });
-
-      paystackHandlerRef.current = handler;
-      handler.openIframe();
+      // The IntaSend button will be triggered by clicking on the hidden button
+      // We need to programmatically trigger the payment
+      const payButton = document.getElementById('intasend-pay-button');
+      if (payButton) {
+        // Update button data attributes with current values
+        payButton.setAttribute('data-amount', totalPaymentAmount.toString());
+        payButton.setAttribute('data-email', `user-${applicationData.id}@loans.app`);
+        payButton.setAttribute('data-phone_number', formData.phoneNumber);
+        payButton.setAttribute('data-first_name', formData.fullName.split(' ')[0] || '');
+        payButton.setAttribute('data-last_name', formData.fullName.split(' ').slice(1).join(' ') || '');
+        payButton.setAttribute('data-api_ref', applicationData.id);
+        payButton.click();
+      } else {
+        throw new Error('Payment button not found. Please refresh the page.');
+      }
 
     } catch (err) {
       clearPaymentTimeout();
@@ -292,6 +312,22 @@ export default function PaymentModal({
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-4 animate-fadeIn pt-20 sm:pt-0">
+      {/* Hidden IntaSend Payment Button */}
+      <button
+        id="intasend-pay-button"
+        className="intaSendPayButton hidden"
+        data-amount={totalPaymentAmount}
+        data-currency="KES"
+        data-email=""
+        data-phone_number=""
+        data-first_name=""
+        data-last_name=""
+        data-api_ref=""
+        data-country="KE"
+      >
+        Pay
+      </button>
+
       <div className="bg-gray-900 border border-gold-500/30 rounded-lg sm:rounded-xl max-w-md w-full max-h-[90vh] overflow-y-auto animate-slideUp">
         {/* Header */}
         <div className="sticky top-0 bg-gray-900 flex items-center justify-between p-4 sm:p-6 border-b border-gold-500/30">
@@ -349,6 +385,13 @@ export default function PaymentModal({
                   </div>
                 </div>
               </div>
+
+              {!intaSendReady && (
+                <div className="flex items-center gap-2 text-yellow-500 text-xs">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  <span>Loading payment gateway...</span>
+                </div>
+              )}
             </>
           )}
 
@@ -360,7 +403,7 @@ export default function PaymentModal({
               <div className="space-y-3 sm:space-y-4">
                 <p className="font-semibold text-base sm:text-lg text-white">Complete Payment</p>
                 <div className="bg-gold-500/10 border border-gold-500/30 rounded-lg p-3 sm:p-4">
-                  <p className="text-xs sm:text-sm text-gold-100 leading-relaxed">Complete your payment in the Paystack popup window.</p>
+                  <p className="text-xs sm:text-sm text-gold-100 leading-relaxed">Complete your payment in the IntaSend popup window.</p>
                 </div>
                 <div className="flex items-center justify-center gap-2 text-sm">
                   <Clock className="w-4 h-4 text-gold-500" />
@@ -443,9 +486,10 @@ export default function PaymentModal({
               </button>
               <button
                 onClick={handleConfirmPayment}
-                className="flex-1 py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-gold-500 text-black font-semibold rounded-lg hover:bg-gold-600 transition-all duration-300"
+                disabled={!intaSendReady}
+                className="flex-1 py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-gold-500 text-black font-semibold rounded-lg hover:bg-gold-600 transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Proceed to Pay
+                {intaSendReady ? 'Proceed to Pay' : 'Loading...'}
               </button>
             </>
           )}
