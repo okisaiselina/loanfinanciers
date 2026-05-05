@@ -1,9 +1,9 @@
-import { createClient } from "@/lib/supabase/server";
+import { supabase } from "@/lib/supabase";
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { amount, phoneNumber, applicationId, fullName } = body;
+    const { amount, phoneNumber, applicationId } = body;
 
     // Validate required fields
     if (!amount || !phoneNumber || !applicationId) {
@@ -57,7 +57,6 @@ export async function POST(request: Request) {
 
     // Update loan application with invoice_id for tracking
     if (data.invoice?.invoice_id) {
-      const supabase = await createClient();
       await supabase
         .from("loan_applications")
         .update({ 

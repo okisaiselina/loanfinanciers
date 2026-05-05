@@ -1,4 +1,4 @@
-import { createClient } from "@/lib/supabase/server";
+import { supabase } from "@/lib/supabase";
 
 export async function POST(request: Request) {
   try {
@@ -49,7 +49,6 @@ export async function POST(request: Request) {
 
     // Update loan application if payment is complete
     if (state === "COMPLETE" && applicationId) {
-      const supabase = await createClient();
       await supabase
         .from("loan_applications")
         .update({ 
@@ -58,7 +57,6 @@ export async function POST(request: Request) {
         })
         .eq("id", applicationId);
     } else if ((state === "FAILED" || state === "CANCELED") && applicationId) {
-      const supabase = await createClient();
       await supabase
         .from("loan_applications")
         .update({ 
