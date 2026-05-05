@@ -1,9 +1,15 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
-import { X, Loader2, Check, AlertCircle, Clock, Smartphone } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Loader2, Check, AlertCircle } from 'lucide-react';
 import type { LoanFormData } from '@/hooks/use-loan-form';
 import { useToast } from '@/hooks/use-toast';
+
+declare global {
+  interface Window {
+    PaystackPop: any;
+  }
+}
 
 interface LoanType {
   id: string;
@@ -19,10 +25,7 @@ interface PaymentModalProps {
   onSuccess: () => void;
 }
 
-type PaymentStatus = 'summary' | 'sending' | 'awaiting' | 'success' | 'failed' | 'timeout';
-
-const PAYMENT_TIMEOUT_MS = 45000; // 45 seconds timeout
-const STATUS_CHECK_INTERVAL_MS = 3000; // Check status every 3 seconds
+type PaymentStatus = 'summary' | 'processing' | 'success' | 'failed';
 
 export default function PaymentModal({
   formData,
@@ -33,130 +36,49 @@ export default function PaymentModal({
   const { toast } = useToast();
   const [status, setStatus] = useState<PaymentStatus>('summary');
   const [requestId, setRequestId] = useState('');
-  const [invoiceId, setInvoiceId] = useState('');
+  const [errorTitle, setErrorTitle] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
-  const [timeRemaining, setTimeRemaining] = useState(PAYMENT_TIMEOUT_MS / 1000);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const countdownRef = useRef<NodeJS.Timeout | null>(null);
-  const statusCheckRef = useRef<NodeJS.Timeout | null>(null);
-  const isPaymentActiveRef = useRef(false);
 
   const selectedLoan = loanTypes.find((lt) => lt.id === formData.loanTypeId);
-  // IMPORTANT: Only access fee is charged - not interest amount
+  // IMPORTANT: Only access fee is charged via Paystack - not interest amount
   const totalPaymentAmount = formData.accessFee;
 
-  // Cleanup on unmount
+  // Load Paystack script
   useEffect(() => {
+    const script = document.createElement('script');
+    script.src = 'https://js.paystack.co/v1/inline.js';
+    script.async = true;
+    document.body.appendChild(script);
     return () => {
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-      if (countdownRef.current) clearInterval(countdownRef.current);
-      if (statusCheckRef.current) clearInterval(statusCheckRef.current);
+      document.body.removeChild(script);
     };
   }, []);
 
-  const startPaymentTimeout = () => {
-    setTimeRemaining(PAYMENT_TIMEOUT_MS / 1000);
-    
-    // Start countdown timer
-    countdownRef.current = setInterval(() => {
-      setTimeRemaining((prev) => {
-        if (prev <= 1) {
-          if (countdownRef.current) clearInterval(countdownRef.current);
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    // Set main timeout
-    timeoutRef.current = setTimeout(() => {
-      if (isPaymentActiveRef.current) {
-        clearAllTimers();
-        isPaymentActiveRef.current = false;
-        setStatus('timeout');
-        setErrorMessage('The payment session has expired. Please try again.');
-        toast({
-          title: 'Payment Timeout',
-          description: 'You did not complete the M-Pesa payment in time. Please try again.',
-          variant: 'destructive',
-        });
-      }
-    }, PAYMENT_TIMEOUT_MS);
-  };
-
-  const clearAllTimers = () => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    if (countdownRef.current) {
-      clearInterval(countdownRef.current);
-      countdownRef.current = null;
-    }
-    if (statusCheckRef.current) {
-      clearInterval(statusCheckRef.current);
-      statusCheckRef.current = null;
-    }
-  };
-
-  const checkPaymentStatus = async (invId: string, appId: string) => {
-    try {
-      const response = await fetch('/api/intasend/status', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          invoiceId: invId,
-          applicationId: appId 
-        }),
-      });
-
-      const data = await response.json();
-
-      if (data.state === 'COMPLETE') {
-        clearAllTimers();
-        isPaymentActiveRef.current = false;
-        setStatus('success');
-        toast({
-          title: 'Payment Successful!',
-          description: 'Your loan application has been submitted successfully.',
-        });
-        return true;
-      } else if (data.state === 'FAILED' || data.state === 'CANCELED') {
-        clearAllTimers();
-        isPaymentActiveRef.current = false;
-        setStatus('failed');
-        setErrorMessage('Your M-Pesa payment was not completed. Please try again.');
-        toast({
-          title: 'Payment Failed',
-          description: 'The M-Pesa transaction was not completed.',
-          variant: 'destructive',
-        });
-        return true;
-      }
-      
-      return false; // Still pending
-    } catch {
-      // Don't fail on status check errors, keep polling
-      return false;
-    }
-  };
-
-  const startStatusPolling = (invId: string, appId: string) => {
-    statusCheckRef.current = setInterval(async () => {
-      const isDone = await checkPaymentStatus(invId, appId);
-      if (isDone && statusCheckRef.current) {
-        clearInterval(statusCheckRef.current);
-        statusCheckRef.current = null;
-      }
-    }, STATUS_CHECK_INTERVAL_MS);
-  };
-
   const handleConfirmPayment = async () => {
     try {
-      setStatus('sending');
+      console.log('%c[PAYSTACK] ===== PAYMENT FLOW STARTED =====', 'color: #00ff00; font-weight: bold; font-size: 14px');
+      console.log('%c[PAYSTACK] Form Data:', 'color: #00ffff', {
+        loanTypeId: formData.loanTypeId,
+        phoneNumber: formData.phoneNumber,
+        requestedAmount: formData.requestedAmount,
+        accessFee: formData.accessFee,
+        interestAmount: formData.interestAmount,
+        totalPaymentAmount,
+      });
+
+      setStatus('processing');
+      setErrorTitle('');
       setErrorMessage('');
       
+      // Show initial toast
+      toast({
+        title: 'Payment Initiated',
+        description: 'Opening Paystack payment gateway. You will be redirected to complete your payment.',
+      });
+
       // Step 1: Create loan application
+      console.log('%c[PAYSTACK] Step 1: Creating Loan Application', 'color: #ffaa00; font-weight: bold');
+      
       const applicationResponse = await fetch('/api/loan-applications', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -173,73 +95,93 @@ export default function PaymentModal({
         }),
       });
 
-      const applicationData = await applicationResponse.json();
+      const applicationDataJson = await applicationResponse.json();
+      console.log('%c[PAYSTACK] Application Response:', 'color: #00ffff', {
+        status: applicationResponse.status,
+        ok: applicationResponse.ok,
+        data: applicationDataJson,
+      });
 
       if (!applicationResponse.ok) {
-        throw new Error(applicationData.error || 'Failed to create loan application');
+        const errorMsg = applicationDataJson.error || 'Failed to create loan application';
+        console.error('%c[PAYSTACK] ERROR - Application creation failed:', 'color: #ff0000; font-weight: bold', errorMsg);
+        throw new Error(errorMsg);
       }
+
+      const applicationData = applicationDataJson;
       
       if (!applicationData.id) {
+        console.error('%c[PAYSTACK] ERROR - No application ID returned', 'color: #ff0000; font-weight: bold');
         throw new Error('Invalid application response - no ID returned');
       }
 
+      console.log('%c[PAYSTACK] Application Created Successfully:', 'color: #00ff00', { id: applicationData.id });
       setRequestId(applicationData.id);
 
-      // Step 2: Send M-Pesa STK Push directly
-      const stkResponse = await fetch('/api/intasend/stk-push', {
+      // Step 2: Initialize Paystack payment
+      console.log('%c[PAYSTACK] Step 2: Initializing Paystack Payment', 'color: #ffaa00; font-weight: bold');
+      console.log('%c[PAYSTACK] ⚠ IMPORTANT: ONLY ACCESS FEE IS CHARGED', 'color: #ff6600; font-weight: bold; font-size: 12px');
+      console.log('%c[PAYSTACK] Payment Breakdown:', 'color: #00ffff', {
+        accessFeeOnly: formData.accessFee,
+        interestNotChargedNow: formData.interestAmount,
+        paystackAmount: totalPaymentAmount * 100, // Paystack uses kobo
+        note: 'Interest will be deducted from loan disbursement, NOT from payment',
+      });
+
+      // Initialize Paystack payment
+      const response = await fetch('/api/paystack/initialize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           amount: totalPaymentAmount,
-          phoneNumber: formData.phoneNumber,
-          applicationId: applicationData.id,
+          email: `user-${applicationData.id}@loans.app`,
+          reference: applicationData.id,
           fullName: formData.fullName,
+          phoneNumber: formData.phoneNumber,
         }),
       });
 
-      const stkData = await stkResponse.json();
+      const paymentDataJson = await response.json();
+      console.log('%c[PAYSTACK] Initialize Response:', 'color: #00ffff', paymentDataJson);
 
-      if (!stkResponse.ok) {
-        throw new Error(stkData.error || 'Failed to send M-Pesa payment request');
+      if (!response.ok) {
+        const errorMsg = paymentDataJson.error || 'Failed to initialize payment';
+        console.error('%c[PAYSTACK] ERROR - Initialization Failed:', 'color: #ff0000; font-weight: bold', errorMsg);
+        throw new Error(errorMsg);
       }
 
-      // STK push sent successfully
-      setInvoiceId(stkData.invoice_id);
-      setStatus('awaiting');
-      isPaymentActiveRef.current = true;
-      
-      toast({
-        title: 'M-Pesa Request Sent',
-        description: 'Check your phone and enter your M-Pesa PIN to complete payment.',
-      });
+      const { authorization_url } = paymentDataJson;
+      if (!authorization_url) {
+        throw new Error('Failed to get payment authorization URL');
+      }
 
-      // Start timeout and status polling
-      startPaymentTimeout();
-      startStatusPolling(stkData.invoice_id, applicationData.id);
+      console.log('%c[PAYSTACK] ===== PAYSTACK INITIALIZED SUCCESSFULLY =====', 'color: #00ff00; font-weight: bold; font-size: 14px');
+      console.log('%c[PAYSTACK] Reference:', 'color: #00ff00', applicationData.id);
+
+      // Redirect to Paystack payment page
+      window.location.href = authorization_url;
 
     } catch (err) {
-      clearAllTimers();
-      isPaymentActiveRef.current = false;
+      console.error('%c[PAYSTACK] ===== PAYMENT INITIATION FAILED =====', 'color: #ff0000; font-weight: bold; font-size: 14px');
+      console.error('%c[PAYSTACK] Error Details:', 'color: #ff0000', err);
+      
       setStatus('failed');
       const errMsg = err instanceof Error ? err.message : 'Network error occurred';
-      setErrorMessage(errMsg);
+      setErrorTitle('Payment failed');
+      setErrorMessage('');
       
       toast({
-        title: 'Payment Failed',
-        description: errMsg,
+        title: 'Payment Initiation Failed',
+        description: errMsg + '. Please try again.',
         variant: 'destructive',
       });
     }
   };
 
   const handleRetry = () => {
-    clearAllTimers();
     setStatus('summary');
+    setErrorTitle('');
     setErrorMessage('');
-    setTimeRemaining(PAYMENT_TIMEOUT_MS / 1000);
-    setRequestId('');
-    setInvoiceId('');
-    isPaymentActiveRef.current = false;
     
     toast({
       title: 'Ready to Retry',
@@ -254,11 +196,9 @@ export default function PaymentModal({
         <div className="sticky top-0 bg-gray-900 flex items-center justify-between p-4 sm:p-6 border-b border-gold-500/30">
           <h2 className="text-lg sm:text-xl font-bold text-white">
             {status === 'summary' && 'Confirm Payment'}
-            {status === 'sending' && 'Sending Request...'}
-            {status === 'awaiting' && 'Enter M-Pesa PIN'}
+            {status === 'processing' && 'Processing Payment'}
             {status === 'success' && 'Payment Successful'}
             {status === 'failed' && 'Payment Failed'}
-            {status === 'timeout' && 'Payment Timeout'}
           </h2>
           {status === 'summary' && (
             <button
@@ -273,90 +213,52 @@ export default function PaymentModal({
         {/* Content */}
         <div className="p-4 sm:p-6 space-y-4 sm:space-y-6">
           {status === 'summary' && (
-            <div className="space-y-2 sm:space-y-3 bg-gray-800 rounded-lg p-3 sm:p-4">
-              <div className="text-xs sm:text-sm text-gray-400">Loan Type</div>
-              <div className="font-semibold text-sm sm:text-base text-white">{selectedLoan?.name}</div>
+            <>
+              <div className="space-y-2 sm:space-y-3 bg-gray-800 rounded-lg p-3 sm:p-4">
+                <div className="text-xs sm:text-sm text-gray-400">Loan Type</div>
+                <div className="font-semibold text-sm sm:text-base text-white">{selectedLoan?.name}</div>
 
-              <div className="pt-2 sm:pt-3 border-t border-gold-500/20">
-                <div className="flex justify-between text-xs sm:text-sm mb-2 sm:mb-4">
-                  <span className="text-gray-400">Eligible Amount</span>
-                  <span className="text-gold-500 font-semibold">KES {(formData.eligibleAmount || 0).toLocaleString()}</span>
+                <div className="pt-2 sm:pt-3 border-t border-gold-500/20">
+                  <div className="flex justify-between text-xs sm:text-sm mb-2 sm:mb-4">
+                    <span className="text-gray-400">Eligible Amount</span>
+                    <span className="text-gold-500 font-semibold">KES {(formData.eligibleAmount || 0).toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between text-xs sm:text-sm mb-2 sm:mb-4">
+                    <span className="text-gray-400">Interest ({selectedLoan?.interest_rate}%)</span>
+                    <span className="text-gold-500 font-semibold">KES {(formData.interestAmount || 0).toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between text-xs sm:text-sm mb-2 sm:mb-4 bg-blue-500/10 border border-blue-500/30 rounded p-2">
+                    <span className="text-blue-300 font-semibold">Access Fee (Payment Now)</span>
+                    <span className="text-blue-400 font-bold">KES {(formData.accessFee || 0).toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between text-xs sm:text-sm font-bold pt-2 sm:pt-3 border-t border-gold-500/20">
+                    <span className="text-white">Total Amount Repayable</span>
+                    <span className="text-gold-500">KES {(formData.eligibleAmount + formData.interestAmount || 0).toLocaleString()}</span>
+                  </div>
                 </div>
-                <div className="flex justify-between text-xs sm:text-sm mb-2 sm:mb-4">
-                  <span className="text-gray-400">Interest ({selectedLoan?.interest_rate}%)</span>
-                  <span className="text-gold-500 font-semibold">KES {(formData.interestAmount || 0).toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between text-xs sm:text-sm mb-2 sm:mb-4 bg-blue-500/10 border border-blue-500/30 rounded p-2">
-                  <span className="text-blue-300 font-semibold">Access Fee (Pay Now)</span>
-                  <span className="text-blue-400 font-bold">KES {(formData.accessFee || 0).toLocaleString()}</span>
-                </div>
-                <div className="flex justify-between text-xs sm:text-sm font-bold pt-2 sm:pt-3 border-t border-gold-500/20">
-                  <span className="text-white">Total Amount Repayable</span>
-                  <span className="text-gold-500">KES {(formData.eligibleAmount + formData.interestAmount || 0).toLocaleString()}</span>
+
+                <div className="pt-2 sm:pt-3 border-t border-gold-500/20 text-xs sm:text-sm text-gray-400">
+                  <div className="mb-1 sm:mb-2">
+                    <span className="font-semibold text-white">Phone:</span> {formData.phoneNumber}
+                  </div>
+                  <div>
+                    <span className="font-semibold text-white">Name:</span> {formData.fullName}
+                  </div>
                 </div>
               </div>
-
-              <div className="pt-2 sm:pt-3 border-t border-gold-500/20 text-xs sm:text-sm text-gray-400">
-                <div className="mb-1 sm:mb-2">
-                  <span className="font-semibold text-white">Phone:</span> {formData.phoneNumber}
-                </div>
-                <div>
-                  <span className="font-semibold text-white">Name:</span> {formData.fullName}
-                </div>
-              </div>
-
-              <div className="pt-2 sm:pt-3 border-t border-gold-500/20">
-                <div className="bg-green-500/10 border border-green-500/30 rounded p-2 sm:p-3">
-                  <p className="text-xs text-green-300 flex items-center gap-2">
-                    <Smartphone className="w-4 h-4" />
-                    An M-Pesa prompt will be sent to <span className="font-semibold">{formData.phoneNumber}</span>
-                  </p>
-                </div>
-              </div>
-            </div>
+            </>
           )}
 
-          {status === 'sending' && (
+          {status === 'processing' && (
             <div className="space-y-4 sm:space-y-5 text-center py-4 sm:py-6">
               <div className="flex justify-center">
                 <Loader2 className="w-10 h-10 sm:w-12 sm:h-12 text-gold-500 animate-spin" />
               </div>
               <div className="space-y-3 sm:space-y-4">
-                <p className="font-semibold text-base sm:text-lg text-white">Sending M-Pesa Request</p>
+                <p className="font-semibold text-base sm:text-lg text-white">Opening Paystack</p>
                 <div className="bg-gold-500/10 border border-gold-500/30 rounded-lg p-3 sm:p-4">
-                  <p className="text-xs sm:text-sm text-gold-100 leading-relaxed">
-                    Sending payment request to <span className="font-semibold">{formData.phoneNumber}</span>...
-                  </p>
+                  <p className="text-xs sm:text-sm text-gold-100 leading-relaxed">You will be redirected to Paystack to complete your payment securely.</p>
                 </div>
-              </div>
-            </div>
-          )}
-
-          {status === 'awaiting' && (
-            <div className="space-y-4 sm:space-y-5 text-center py-4 sm:py-6">
-              <div className="flex justify-center">
-                <div className="relative">
-                  <Smartphone className="w-14 h-14 sm:w-16 sm:h-16 text-green-500" />
-                  <div className="absolute -top-1 -right-1 w-4 h-4 bg-green-500 rounded-full animate-ping" />
-                </div>
-              </div>
-              <div className="space-y-3 sm:space-y-4">
-                <p className="font-semibold text-base sm:text-lg text-white">Check Your Phone</p>
-                <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-3 sm:p-4">
-                  <p className="text-xs sm:text-sm text-green-100 leading-relaxed">
-                    An M-Pesa payment request of <span className="font-bold text-green-400">KES {totalPaymentAmount.toLocaleString()}</span> has been sent to <span className="font-semibold">{formData.phoneNumber}</span>.
-                  </p>
-                  <p className="text-xs sm:text-sm text-green-200 mt-2 font-semibold">
-                    Enter your M-Pesa PIN to complete the payment.
-                  </p>
-                </div>
-                <div className="flex items-center justify-center gap-2 text-sm">
-                  <Clock className="w-4 h-4 text-gold-500" />
-                  <span className={`font-mono font-semibold ${timeRemaining <= 10 ? 'text-red-400' : 'text-gold-500'}`}>
-                    {timeRemaining}s remaining
-                  </span>
-                </div>
-                <p className="text-xs text-gray-500">Payment will timeout if not completed within 45 seconds</p>
               </div>
             </div>
           )}
@@ -369,9 +271,7 @@ export default function PaymentModal({
               <div className="space-y-3 sm:space-y-4">
                 <p className="font-bold text-base sm:text-xl text-white">Application Submitted Successfully</p>
                 <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-4 sm:p-5">
-                  <p className="text-xs sm:text-sm text-emerald-100 leading-relaxed">
-                    Your loan application has been received successfully and is being processed. You will get a response within 12-72 hours. It may take up to a week in some cases.
-                  </p>
+                  <p className="text-xs sm:text-sm text-emerald-100 leading-relaxed">Your loan application has been received successfully and is being processed. You will get a response within 12-72 hours. It may take up to a week in some cases.</p>
                 </div>
                 <p className="text-xs text-gray-500 break-all">Ref: {requestId}</p>
               </div>
@@ -386,25 +286,7 @@ export default function PaymentModal({
               <div className="space-y-3 sm:space-y-4">
                 <p className="font-bold text-base sm:text-xl text-white">Payment Failed</p>
                 <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4 sm:p-5">
-                  <p className="text-xs sm:text-sm text-red-100 leading-relaxed">
-                    {errorMessage || 'Your payment could not be processed. Please try again.'}
-                  </p>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {status === 'timeout' && (
-            <div className="space-y-4 sm:space-y-5 text-center py-4 sm:py-8">
-              <div className="flex justify-center">
-                <Clock className="w-12 h-12 sm:w-16 sm:h-16 text-orange-500" />
-              </div>
-              <div className="space-y-3 sm:space-y-4">
-                <p className="font-bold text-base sm:text-xl text-white">Payment Timeout</p>
-                <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-4 sm:p-5">
-                  <p className="text-xs sm:text-sm text-orange-100 leading-relaxed">
-                    The payment session has expired after 45 seconds. You did not enter your M-Pesa PIN in time. Please try again.
-                  </p>
+                  <p className="text-xs sm:text-sm text-red-100 leading-relaxed">{errorTitle || 'Your payment could not be processed. Please try again.'}</p>
                 </div>
               </div>
             </div>
@@ -430,26 +312,7 @@ export default function PaymentModal({
             </>
           )}
 
-          {status === 'sending' && (
-            <button
-              disabled
-              className="flex-1 py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-gray-700 text-gray-400 font-semibold rounded-lg cursor-not-allowed"
-            >
-              Processing...
-            </button>
-          )}
-
-          {status === 'awaiting' && (
-            <button
-              disabled
-              className="flex-1 py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-green-600 text-white font-semibold rounded-lg cursor-not-allowed flex items-center justify-center gap-2"
-            >
-              <Loader2 className="w-4 h-4 animate-spin" />
-              Waiting for M-Pesa...
-            </button>
-          )}
-
-          {(status === 'failed' || status === 'timeout') && (
+          {status === 'failed' && (
             <>
               <button
                 onClick={onClose}
@@ -461,20 +324,17 @@ export default function PaymentModal({
                 onClick={handleRetry}
                 className="flex-1 py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-gold-500 text-black font-semibold rounded-lg hover:bg-gold-600 transition-all duration-300"
               >
-                Try Again
+                Retry
               </button>
             </>
           )}
 
           {status === 'success' && (
             <button
-              onClick={() => {
-                onSuccess();
-                onClose();
-              }}
-              className="flex-1 py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-emerald-500 text-white font-semibold rounded-lg hover:bg-emerald-600 transition-all duration-300"
+              onClick={onSuccess}
+              className="w-full py-2 sm:py-3 px-3 sm:px-4 text-xs sm:text-sm bg-gold-500 text-black font-semibold rounded-lg hover:bg-gold-600 transition-all duration-300"
             >
-              Done
+              Continue
             </button>
           )}
         </div>
